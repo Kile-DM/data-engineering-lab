@@ -1,0 +1,77 @@
+<clickhouse>
+    <logger>
+        <level>warning</level>
+        <console>true</console>
+    </logger>
+
+    <listen_host>0.0.0.0</listen_host>
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+    <interserver_http_port>9009</interserver_http_port>
+    <interserver_http_host>ch1-1</interserver_http_host>
+
+    <max_connections>1024</max_connections>
+    <keep_alive_timeout>10</keep_alive_timeout>
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+
+    <timezone>Europe/Moscow</timezone>
+
+    <mark_cache_size>268435456</mark_cache_size>
+
+    <zookeeper>
+        <node>
+            <host>keeper</host>
+            <port>9181</port>
+        </node>
+        <session_timeout_ms>30000</session_timeout_ms>
+        <operation_timeout_ms>10000</operation_timeout_ms>
+    </zookeeper>
+
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+        <pool_size>4</pool_size>
+        <task_timeout>120</task_timeout>
+    </distributed_ddl>
+
+    <macros>
+        <cluster>lab_cluster</cluster>
+        <shard>1</shard>
+        <replica>ch1-1</replica>
+    </macros>
+
+    <remote_servers>
+        <lab_cluster>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>ch1-1</host>
+                    <port>9000</port>
+                    <user>admin</user>
+                    <password>admin</password>
+                </replica>
+                <replica>
+                    <host>ch1-2</host>
+                    <port>9000</port>
+                    <user>admin</user>
+                    <password>admin</password>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>ch2-1</host>
+                    <port>9000</port>
+                    <user>admin</user>
+                    <password>admin</password>
+                </replica>
+                <replica>
+                    <host>ch2-2</host>
+                    <port>9000</port>
+                    <user>admin</user>
+                    <password>admin</password>
+                </replica>
+            </shard>
+        </lab_cluster>
+    </remote_servers>
+</clickhouse>

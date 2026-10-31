@@ -1,0 +1,313 @@
+name: de-lab
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+  image: de-lab/airflow:2.10.5
+  user: "50000:0"
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:admin@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__WEBSERVER__BASE_URL: http://192.168.0.13:8080
+    TZ: ${TZ}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - airflow_logs:/opt/airflow/logs
+  networks: [lab-net]
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- Postgres
+  postgres:
+    image: postgres:16-alpine
+    container_name: lab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${LAB_USER}
+      POSTGRES_PASSWORD: ${LAB_PASSWORD}
+      POSTGRES_DB: airflow
+      TZ: ${TZ}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LAB_USER} -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 1g
+    networks: [lab-net]
+
+  # ----------------------------------------------------------------- Airflow
+  airflow-init:
+    <<: *airflow-common
+    container_name: lab-airflow-init
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username ${LAB_USER} \
+          --password ${LAB_PASSWORD} \
+          --firstname Admin \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com || true
+        echo "Airflow init finished"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: lab-airflow-webserver
+    restart: unless-stopped
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    mem_limit: 2g
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: lab-airflow-scheduler
+    restart: unless-stopped
+    command: scheduler
+    mem_limit: 2g
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------------------- MinIO
+  minio:
+    image: bitnamilegacy/minio:latest
+    container_name: lab-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+      MINIO_DEFAULT_BUCKETS: warehouse,raw,processed
+      MINIO_BROWSER: "on"
+      TZ: ${TZ}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 1g
+    networks: [lab-net]
+
+  minio-init:
+    image: bitnamilegacy/minio:latest
+    container_name: lab-minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_HOST_lab: http://${MINIO_USER}:${MINIO_PASSWORD}@minio:9000
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mc mb --ignore-existing lab/warehouse
+        mc mb --ignore-existing lab/raw
+        mc mb --ignore-existing lab/processed
+        mc ls lab
+        echo "MinIO buckets ready"
+    networks: [lab-net]
+
+  # ----------------------------------------------------------------- Jupyter
+  jupyter:
+    build:
+      context: ./jupyter
+    image: de-lab/jupyter-pyspark:3.5.3
+    container_name: lab-jupyter
+    restart: unless-stopped
+    environment:
+      JUPYTER_TOKEN: ${LAB_PASSWORD}
+      JUPYTER_ENABLE_LAB: "yes"
+      TZ: ${TZ}
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+    depends_on:
+      minio:
+        condition: service_healthy
+      ch1-1:
+        condition: service_healthy
+    mem_limit: 4g
+    networks: [lab-net]
+
+  # ------------------------------------------------------- ClickHouse Keeper
+  keeper:
+    image: clickhouse/clickhouse-keeper:24.8
+    container_name: lab-keeper
+    restart: unless-stopped
+    volumes:
+      - ./clickhouse/keeper/keeper_config.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      - keeper_data:/var/lib/clickhouse/coordination
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9181'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 512m
+    networks: [lab-net]
+
+  # ------------------------------------------------------ ClickHouse shard 1
+  ch1-1:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: lab-ch1-1
+    restart: unless-stopped
+    hostname: ch1-1
+    environment:
+      TZ: ${TZ}
+    ports:
+      - "8123:8123"   # HTTP
+      - "9101:9000"   # native TCP
+    volumes:
+      - ./clickhouse/ch1-1/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse/ch1-1/users.d:/etc/clickhouse-server/users.d:ro
+      - ch1_1_data:/var/lib/clickhouse
+    depends_on:
+      keeper:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "-u", "admin", "--password", "admin", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+    networks: [lab-net]
+
+  ch1-2:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: lab-ch1-2
+    restart: unless-stopped
+    hostname: ch1-2
+    ports:
+      - "8124:8123"
+      - "9102:9000"
+    volumes:
+      - ./clickhouse/ch1-2/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse/ch1-2/users.d:/etc/clickhouse-server/users.d:ro
+      - ch1_2_data:/var/lib/clickhouse
+    depends_on:
+      keeper:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "-u", "admin", "--password", "admin", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+    networks: [lab-net]
+
+  # ------------------------------------------------------ ClickHouse shard 2
+  ch2-1:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: lab-ch2-1
+    restart: unless-stopped
+    hostname: ch2-1
+    ports:
+      - "8125:8123"
+      - "9103:9000"
+    volumes:
+      - ./clickhouse/ch2-1/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse/ch2-1/users.d:/etc/clickhouse-server/users.d:ro
+      - ch2_1_data:/var/lib/clickhouse
+    depends_on:
+      keeper:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "-u", "admin", "--password", "admin", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+    networks: [lab-net]
+
+  ch2-2:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: lab-ch2-2
+    restart: unless-stopped
+    hostname: ch2-2
+    ports:
+      - "8126:8123"
+      - "9104:9000"
+    volumes:
+      - ./clickhouse/ch2-2/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse/ch2-2/users.d:/etc/clickhouse-server/users.d:ro
+      - ch2_2_data:/var/lib/clickhouse
+    depends_on:
+      keeper:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "-u", "admin", "--password", "admin", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+    networks: [lab-net]
+
+networks:
+  lab-net:
+    name: lab-net
+
+volumes:
+  postgres_data:
+  minio_data:
+  airflow_logs:
+  keeper_data:
+  ch1_1_data:
+  ch1_2_data:
+  ch2_1_data:
+  ch2_2_data:

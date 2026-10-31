@@ -1,0 +1,6 @@
+apache-airflow-providers-amazon
+apache-airflow-providers-postgres
+clickhouse-connect
+boto3
+pandas
+pyarrow
